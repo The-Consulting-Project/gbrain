@@ -63,6 +63,7 @@ import { loadConfig } from '../config.ts';
 import type { GBrainConfig } from '../config.ts';
 import { mergedProviderEnv } from './provider-env.ts';
 import { buildGatewayConfig, foldNativeBaseUrlsFromFilePlane } from './build-gateway-config.ts';
+import { logApiCost } from './cost-log.ts';
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
 //
@@ -1873,6 +1874,25 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
         });
       } catch {
         // BudgetExhausted (TX1) — original throw (if any) wins.
+      }
+    }
+    // Cost ledger (2026-08-10): log SUCCESSFUL embed calls only (skip failures
+    // so quota-exhaustion retry storms don't inflate the ledger with phantom
+    // cost). Kept separate from the tracker block above so that path stays
+    // identical; non-throwing by contract.
+    if (!_embedThrew) {
+      try {
+        const cpt = recipe.touchpoints?.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
+        const chars = truncated.reduce((s, t) => s + t.length, 0);
+        logApiCost({
+          model: `${recipe.id}:${modelId}`,
+          source: 'gateway.embed',
+          input_tokens: Math.ceil(chars / Math.max(cpt, 1)),
+          output_tokens: 0,
+          kind: 'embed',
+        });
+      } catch {
+        // never mask the embed result
       }
     }
   }
@@ -3840,6 +3860,16 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
 
     const { inputTokens: inTok, outputTokens: outTok } = normalizeSdkUsage(usage);
     _recordBudget(`${recipe.id}:${modelId}`, inTok, outTok);
+    // Cost ledger (2026-08-10): log SUCCESSFUL chat calls only (this line is
+    // past the provider await, so failures divert to the catch below and are
+    // not charged). Fires regardless of BudgetTracker presence. Non-throwing.
+    logApiCost({
+      model: `${recipe.id}:${modelId}`,
+      source: 'gateway.chat',
+      input_tokens: inTok,
+      output_tokens: outTok,
+      kind: 'chat',
+    });
 
     const usageOut = {
       input_tokens: inTok,
