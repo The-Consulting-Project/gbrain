@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
 import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
-import { loadConfig, gbrainPath } from '../core/config.ts';
+import { loadConfig, loadConfigWithEngine, gbrainPath, type GBrainConfig } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import {
@@ -496,7 +496,9 @@ export async function runImport(
       // unreachable when the gate is off; defense-in-depth check anyway.
       const result = isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack });
+        : await importFile(eng, filePath, importRelPath, {
+            noEmbed, sourceId, activePack: importActivePack, effectiveCfg: importEffectiveCfg,
+          });
       noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning);
       const _fileMs = Date.now() - _fileT0;
       if (_fileMs > 5000) {
@@ -572,6 +574,29 @@ export async function runImport(
         timestamp: new Date().toISOString(),
       });
     }
+  }
+
+  // Resolve the file+DB-merged config ONCE per run and thread it into every
+  // processFile call — same rule as importActivePack above (never per-file).
+  //
+  // importFromContent's content-sanity gate calls loadConfigWithEngine, which
+  // issues 12 SEQUENTIAL getConfig round trips (~3.4s against a remote pooler),
+  // and it did so BEFORE the content_hash short-circuit. So an unchanged file
+  // cost ~3.6s to skip when its own lookup is ~0.17s: a 2012-file brain needed
+  // ~7175s against backup.sh's 600s gtimeout, and phase0's nightly disk→DB
+  // import was SIGTERM'd at ~8% every night, never once completing.
+  //
+  // The merge is per-DATABASE, not per-engine, so this one resolution is also
+  // correct for the parallel workers below (they open more connections to the
+  // same database). Falls back to file/env on a transient engine error, which
+  // is the same posture the per-file try/catch had.
+  const baseRunCfg = loadConfig();
+  let importEffectiveCfg: GBrainConfig | null = baseRunCfg;
+  try {
+    importEffectiveCfg = await loadConfigWithEngine(engine, baseRunCfg);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[gbrain] content-sanity: DB config lift failed (${msg}); falling back to file/env`);
   }
 
   if (actualWorkers > 1) {

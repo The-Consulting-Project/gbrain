@@ -33,7 +33,7 @@ import {
   buildContentFlagMarker,
   isQuarantined,
 } from './quarantine.ts';
-import { loadConfig, loadConfigWithEngine } from './config.ts';
+import { loadConfig, loadConfigWithEngine, type GBrainConfig } from './config.ts';
 import {
   buildContextualPrefix,
   modeRequiresSynopsis,
@@ -334,6 +334,24 @@ export async function importFromContent(
      */
     activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
     /**
+     * Pre-resolved file+DB-merged config, threaded once per command — NEVER
+     * per file (same rule as `activePack` above; codex perf finding #7).
+     *
+     * The content-sanity gate below needs `loadConfigWithEngine`, which issues
+     * TWELVE sequential `getConfig` round trips. That ran per file, BEFORE the
+     * `content_hash` short-circuit, so every unchanged file paid it: measured
+     * 3399ms of config reads to decide to skip a file whose own lookup costs
+     * 167ms — 95% of import wall-clock spent re-reading identical values. It
+     * put a 2012-file brain at ~7175s against backup.sh's 600s gtimeout, so
+     * phase0's disk→DB import was SIGTERM'd nightly at ~8% and never once
+     * completed.
+     *
+     * Config is invariant across a single import run, so callers resolve it
+     * once and pass it here. Unset = pre-fix behavior (load per call), which
+     * keeps every other importFromContent caller byte-identical.
+     */
+    effectiveCfg?: GBrainConfig | null;
+    /**
      * v0.39.3.0 provenance write-through (WARN-8). When set, threaded to
      * `tx.putPage` so the page's `source_kind`, `source_uri`,
      * `ingested_via` DB columns get populated. The trust gate lives at the
@@ -472,17 +490,23 @@ export async function importFromContent(
   let pageFlagged = false;
   let pageFlagReason: 'markup_heavy' | 'oversized' | undefined;
   {
-    const baseCfg = loadConfig();
-    let effectiveCfg = baseCfg;
-    try {
-      // loadConfigWithEngine merges DB-plane content_sanity.* on top
-      // of file/env. Wrapped in try/catch so a transient engine error
-      // doesn't kill the import — the gate falls back to file/env
-      // values (which include defaults via the assessor itself).
-      effectiveCfg = await loadConfigWithEngine(engine, baseCfg);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[gbrain] content-sanity: DB config lift failed (${msg}); falling back to file/env\n`);
+    // Caller-supplied config wins: it's the same merge, resolved once per
+    // command instead of once per file (see `effectiveCfg` in opts).
+    // `undefined` = not supplied (resolve here); an explicit `null` is a
+    // resolved value and must NOT fall through to loadConfig().
+    let effectiveCfg = opts.effectiveCfg !== undefined ? opts.effectiveCfg : loadConfig();
+    if (opts.effectiveCfg === undefined) {
+      const baseCfg = effectiveCfg;
+      try {
+        // loadConfigWithEngine merges DB-plane content_sanity.* on top
+        // of file/env. Wrapped in try/catch so a transient engine error
+        // doesn't kill the import — the gate falls back to file/env
+        // values (which include defaults via the assessor itself).
+        effectiveCfg = await loadConfigWithEngine(engine, baseCfg);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[gbrain] content-sanity: DB config lift failed (${msg}); falling back to file/env\n`);
+      }
     }
     const cs = effectiveCfg?.content_sanity ?? {};
     // GBRAIN_NO_SANITY=1 fast-path: loadConfig() returns null when
@@ -1220,6 +1244,8 @@ export async function importFromFile(
      * never per file (codex perf finding #7).
      */
     activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
+    /** Resolved once per command and spread through to importFromContent. See its opts. */
+    effectiveCfg?: GBrainConfig | null;
   } = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
